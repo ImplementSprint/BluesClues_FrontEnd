@@ -1,0 +1,353 @@
+########################################################################
+# MASTER FRONTEND PIPELINE — SINGLE SYSTEM
+# Stack: Next.js (React) — Test on Replit → UAT/Prod on Vercel
+# Flow:  test → uat → pre-production → backup → governance → production
+# Copy to: .github/workflows/master-frontend.yml
+# NOTE: Repository is PUBLIC. Never commit secrets or .env files.
+########################################################################
+name: 🖥️ Frontend Master Pipeline
+
+on:
+  push:
+    branches: [test, uat, main]
+  pull_request:
+    branches: [test, uat, main]
+
+env:
+  TRIBE_NAME:        ${{ vars.TRIBE_NAME }}
+  SYSTEM_NAME:       ${{ vars.SYSTEM_NAME }}
+  APP_NAME:          ${{ vars.APP_NAME }}
+  SONAR_TOKEN:       ${{ secrets.SONAR_TOKEN }}
+  SONAR_PROJECT_KEY: ${{ vars.SONAR_PROJECT_KEY }}
+  VERCEL_ORG_ID:     ${{ secrets.VERCEL_ORG_ID }}
+
+concurrency:
+  group: frontend-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════
+  # TEST BRANCH
+  # ════════════════════════════════════════════════════════════════════
+  test:
+    name: "[TEST] Run Tests (Jest/Vitest)"
+    if: github.ref == 'refs/heads/test' || (github.event_name == 'pull_request' && github.base_ref == 'test')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci
+      - run: npm test -- --coverage --passWithNoTests
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-coverage-${{ github.run_number }}
+          path: coverage/
+          retention-days: 30
+
+  sonar-test:
+    name: "[TEST] SonarCloud Analysis"
+    if: github.ref == 'refs/heads/test' || (github.event_name == 'pull_request' && github.base_ref == 'test')
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN:  ${{ env.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ env.SONAR_PROJECT_KEY }}
+            -Dsonar.organization=${{ vars.SONAR_ORG }}
+            -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info
+
+  quality-gate-test:
+    name: "[TEST] Quality Gate Approval"
+    if: github.ref == 'refs/heads/test' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: sonar-test
+    environment: test-quality-gate
+    steps:
+      - run: echo "✅ Test quality gate approved"
+
+  deploy-replit-test:
+    name: "[TEST] Deploy to Replit (Test)"
+    if: github.ref == 'refs/heads/test' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: quality-gate-test
+    environment:
+      name: test
+      url: ${{ vars.REPLIT_APP_URL_TEST }}
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+      - name: Deploy to Replit (zero-infra test environment)
+        run: |
+          curl -X POST "${{ secrets.REPLIT_DEPLOY_HOOK_TEST }}" \
+            -H "Authorization: Bearer ${{ secrets.REPLIT_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"branch":"test","env":"test"}'
+      - name: Create GitHub Pre-Release (test)
+        uses: ncipollo/release-action@v1
+        with:
+          tag: "${{ env.TRIBE_NAME }}-${{ env.SYSTEM_NAME }}-frontend-v${{ steps.version.outputs.VERSION }}-test"
+          name: "[${{ env.TRIBE_NAME }}/${{ env.SYSTEM_NAME }}] Frontend Test v${{ steps.version.outputs.VERSION }}"
+          prerelease: true
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  notify-test:
+    name: "[TEST] Notify"
+    if: github.ref == 'refs/heads/test' && github.event_name == 'push' && always()
+    runs-on: ubuntu-latest
+    needs: [deploy-replit-test]
+    uses: ./.github/workflows/notify.yml
+    with:
+      status: ${{ needs.deploy-replit-test.result }}
+      pipeline: "${{ vars.TRIBE_NAME }}/${{ vars.SYSTEM_NAME }} Frontend – Test"
+      version: ${{ needs.deploy-replit-test.outputs.version }}
+      environment: test
+      tribe: ${{ vars.TRIBE_NAME }}
+      system: ${{ vars.SYSTEM_NAME }}
+    secrets: inherit
+
+  # ════════════════════════════════════════════════════════════════════
+  # UAT BRANCH
+  # ════════════════════════════════════════════════════════════════════
+  build-uat:
+    name: "[UAT] Build (Next.js)"
+    if: github.ref == 'refs/heads/uat' || (github.event_name == 'pull_request' && github.base_ref == 'uat')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci
+      - run: npm run build
+        env: { NEXT_PUBLIC_APP_ENV: uat }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: uat-build-${{ github.run_number }}
+          path: .next/
+          retention-days: 14
+
+  deploy-uat:
+    name: "[UAT] Deploy to Vercel"
+    if: github.ref == 'refs/heads/uat' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: build-uat
+    environment:
+      name: uat
+      url: ${{ steps.deploy.outputs.url }}
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+      - name: Deploy to Vercel (UAT)
+        id: deploy
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ env.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID_UAT }}
+          vercel-args: '--prod'
+
+  e2e-uat:
+    name: "[UAT] Selenium + k6 Tests"
+    if: github.ref == 'refs/heads/uat' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: deploy-uat
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci
+      - name: Run Selenium E2E tests
+        run: npm run test:e2e
+        env:
+          APP_URL: ${{ needs.deploy-uat.outputs.url }}
+      - name: k6 load test
+        run: |
+          sudo apt-get update && sudo apt-get install -y k6
+          k6 run tests/load/frontend-load.js
+        env:
+          K6_BASE_URL: ${{ needs.deploy-uat.outputs.url }}
+
+  qa-gate-uat:
+    name: "[UAT] QA Developer Approval"
+    if: github.ref == 'refs/heads/uat' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: e2e-uat
+    environment: uat-qa-gate
+    steps:
+      - run: echo "✅ UAT QA approved"
+
+  release-uat:
+    name: "[UAT] GitHub Pre-Release"
+    if: github.ref == 'refs/heads/uat' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: qa-gate-uat
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+      - uses: ncipollo/release-action@v1
+        with:
+          tag: "${{ env.TRIBE_NAME }}-${{ env.SYSTEM_NAME }}-frontend-v${{ steps.version.outputs.VERSION }}-uat"
+          name: "[${{ env.TRIBE_NAME }}/${{ env.SYSTEM_NAME }}] Frontend UAT v${{ steps.version.outputs.VERSION }}"
+          prerelease: true
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  notify-uat:
+    name: "[UAT] Notify"
+    if: github.ref == 'refs/heads/uat' && github.event_name == 'push' && always()
+    runs-on: ubuntu-latest
+    needs: [release-uat, deploy-uat]
+    uses: ./.github/workflows/notify.yml
+    with:
+      status: ${{ needs.release-uat.result }}
+      pipeline: "${{ vars.TRIBE_NAME }}/${{ vars.SYSTEM_NAME }} Frontend – UAT"
+      version: ${{ needs.deploy-uat.outputs.version }}
+      environment: uat
+      tribe: ${{ vars.TRIBE_NAME }}
+      system: ${{ vars.SYSTEM_NAME }}
+    secrets: inherit
+
+  # ════════════════════════════════════════════════════════════════════
+  # PRODUCTION / MAIN BRANCH
+  # ════════════════════════════════════════════════════════════════════
+  build-prod:
+    name: "[PROD] Build (Next.js)"
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.base_ref == 'main')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20, cache: npm }
+      - run: npm ci
+      - run: npm run build
+        env: { NEXT_PUBLIC_APP_ENV: production }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prod-build-${{ github.run_number }}
+          path: .next/
+          retention-days: 90
+
+  deploy-preprod:
+    name: "[PROD] Deploy to Pre-Production (Vercel)"
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: build-prod
+    environment:
+      name: pre-production
+      url: ${{ steps.deploy.outputs.url }}
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+      - name: Deploy to Vercel (Pre-Prod)
+        id: deploy
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ env.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID_PROD }}
+          vercel-args: '--prod'
+
+  backup-preprod:
+    name: "[PROD] Backup Deployment Manifest"
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: deploy-preprod
+    steps:
+      - uses: actions/checkout@v4
+      - name: Commit manifest to backup repository
+        run: |
+          git config --global user.name  "CI/CD Bot"
+          git config --global user.email "cicd-bot@org.local"
+          git clone https://x-access-token:${{ secrets.BACKUP_REPO_PAT }}@github.com/${{ vars.BACKUP_REPO }} /tmp/backup-repo
+          mkdir -p /tmp/backup-repo/${{ env.TRIBE_NAME }}/${{ env.SYSTEM_NAME }}/frontend
+          cat > /tmp/backup-repo/${{ env.TRIBE_NAME }}/${{ env.SYSTEM_NAME }}/frontend/pre-prod-${{ needs.deploy-preprod.outputs.version }}.json << EOF
+          {
+            "tribe":       "${{ env.TRIBE_NAME }}",
+            "system":      "${{ env.SYSTEM_NAME }}",
+            "repo_type":   "frontend",
+            "version":     "${{ needs.deploy-preprod.outputs.version }}",
+            "tag":         "${{ env.TRIBE_NAME }}-${{ env.SYSTEM_NAME }}-frontend-v${{ needs.deploy-preprod.outputs.version }}",
+            "environment": "pre-production",
+            "vercel_url":  "${{ needs.deploy-preprod.outputs.url }}",
+            "timestamp":   "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "run_url":     "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "deployed_by": "${{ github.actor }}"
+          }
+          EOF
+          cd /tmp/backup-repo
+          git add .
+          git commit -m "backup: ${{ env.TRIBE_NAME }}/${{ env.SYSTEM_NAME }} frontend pre-prod v${{ needs.deploy-preprod.outputs.version }}"
+          git push
+
+  governance:
+    name: "[PROD] Governance / Change Control"
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: backup-preprod
+    environment: governance
+    steps:
+      - run: echo "✅ Governance approved"
+
+  deploy-production:
+    name: "[PROD] Deploy to True Live (Vercel)"
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    needs: governance
+    environment:
+      name: production
+      url: https://${{ vars.PROD_DOMAIN }}
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+      - name: Deploy to Vercel (Production — promote from pre-prod build)
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ env.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID_PROD }}
+          vercel-args: '--prod'
+      - name: Create Production GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: "${{ env.TRIBE_NAME }}-${{ env.SYSTEM_NAME }}-frontend-v${{ steps.version.outputs.VERSION }}"
+          name: "[${{ env.TRIBE_NAME }}/${{ env.SYSTEM_NAME }}] Frontend Release v${{ steps.version.outputs.VERSION }}"
+          makeLatest: true
+          allowUpdates: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  notify-prod:
+    name: "[PROD] Notify"
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && always()
+    runs-on: ubuntu-latest
+    needs: [deploy-production]
+    uses: ./.github/workflows/notify.yml
+    with:
+      status: ${{ needs.deploy-production.result }}
+      pipeline: "${{ vars.TRIBE_NAME }}/${{ vars.SYSTEM_NAME }} Frontend – Production"
+      version: ${{ needs.deploy-production.outputs.version }}
+      environment: production
+      tribe: ${{ vars.TRIBE_NAME }}
+      system: ${{ vars.SYSTEM_NAME }}
+    secrets: inherit
