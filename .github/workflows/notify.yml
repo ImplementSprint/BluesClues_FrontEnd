@@ -1,0 +1,17 @@
+name: Reusable Notification Workflow
+on:
+  workflow_call:
+    inputs:
+      status:
+        required: true
+        type: string
+      pipeline:
+        required: true
+        type: string
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Notification
+        run: echo "Pipeline ${{ inputs.pipeline }} finished with status ${{ inputs.status }}"
